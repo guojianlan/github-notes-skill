@@ -36,6 +36,10 @@ gh auth login --hostname github.com --git-protocol https --web
 
 更新和追加要求刚读取的文件 SHA，远程变化后拒绝覆盖。网络中断或写入结果未知时，先检查远程文件和提交再决定重试。单篇上限为 240 KiB，搜索按页扫描正文，必须查看 `next_cursor`、`skipped` 和扫描数量。
 
+1.1 起支持 `notes_categories` 分类清单，`notes_list/search` 可按 `category` 路径前缀筛选；`notes_asset_create` 保存本机 PNG/JPEG/WebP 到笔记目录的 `assets/`，单张上限 8 MiB，创建后逐字节读回校验，不覆盖不同图片。图片生成使用客户端自身可用工具，MCP 不内置图像模型。Mermaid 直接保留在 Markdown，GitHub 可显示流程图；原有 VuePress 站点是否支持 Mermaid 需独立检查，技能不自动改站点构建。
+
+更新脚本后，已经运行的 stdio MCP 可能仍提供旧工具列表；重启该 MCP/客户端后加载。当前聊天可先通过 Skill CLI 使用新工具。更新本机安装不等于已经发布上游代码或更新其他电脑。
+
 默认使用私有笔记库。若用户明确要保存到公开库，绑定时设置 `allow_public: true`。通用源码公开不代表允许把其他内容公开。
 
 ## MCP 的运行位置

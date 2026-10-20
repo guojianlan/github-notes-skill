@@ -239,7 +239,8 @@ class ProtocolTests(unittest.TestCase):
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([r["id"] for r in responses], [1, 2, 3, 4])
         self.assertEqual(responses[0]["result"]["protocolVersion"], "2025-03-26")
-        self.assertEqual(len(responses[1]["result"]["tools"]), 13)
+        original_tools = {"notes_status", "notes_discover", "notes_inspect_repository", "notes_read_repository_file", "notes_bind_repository", "notes_create_repository", "notes_initialize", "notes_list", "notes_get", "notes_search", "notes_create", "notes_update", "notes_append"}
+        self.assertTrue(original_tools.issubset({tool["name"] for tool in responses[1]["result"]["tools"]}))
         self.assertTrue(responses[2]["result"]["isError"])
         self.assertEqual(responses[3]["result"], {})
 

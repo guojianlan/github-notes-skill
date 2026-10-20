@@ -2,6 +2,7 @@
 """GitHub notes CLI and stdio MCP; Python 3.9+ and gh, no Python packages."""
 import argparse
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,9 +13,10 @@ import sys
 import tempfile
 from urllib.parse import quote
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MARKER = ".github-notes.json"
 MAX_BYTES = 240 * 1024
+MAX_ASSET_BYTES = 8 * 1024 * 1024
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 
@@ -309,6 +311,10 @@ class Notes:
         relative = path_name(path)
         if not relative.lower().endswith(".md"):
             raise Error("Note files must use .md.", "invalid_path")
+        return self.scoped_path(cfg, relative, check_links)
+
+    def scoped_path(self, cfg, path, check_links=True):
+        relative = path_name(path)
         full = cfg["root"] + "/" + relative
         if check_links:
             for entry in self.tree(cfg["repository"], cfg["branch"]):
@@ -316,10 +322,12 @@ class Notes:
                     raise Error("Notes cannot follow repository symlinks or submodules.", "invalid_path")
         return full
 
-    def paths(self, cfg):
+    def paths(self, cfg, category=None):
+        category_prefix = path_name(category).rstrip("/") + "/" if category is not None else ""
         prefix = cfg["root"] + "/"
         return sorted(v["path"][len(prefix):] for v in self.tree(cfg["repository"], cfg["branch"])
                       if v["type"] == "blob" and v.get("mode") != "120000" and v["path"].startswith(prefix)
+                      and v["path"][len(prefix):].startswith(category_prefix)
                       and v["path"].lower().endswith(".md") and not any(p.startswith(".") for p in v["path"][len(prefix):].split("/")))
 
     @staticmethod
@@ -327,24 +335,41 @@ class Notes:
         if cursor < 0 or not 1 <= limit <= maximum:
             raise Error("Invalid cursor or limit.", "invalid_page")
 
-    def notes_list(self, cursor=0, limit=100):
+    def notes_list(self, cursor=0, limit=100, category=None):
         self.pagination(cursor, limit, 200)
         cfg, _ = self.binding()
-        paths = self.paths(cfg)
-        return {"repository": cfg["repository"], "root": cfg["root"], "files": paths[cursor:cursor + limit], "total": len(paths),
+        paths = self.paths(cfg, category)
+        return {"repository": cfg["repository"], "root": cfg["root"], "category": category, "files": paths[cursor:cursor + limit], "total": len(paths),
                 "next_cursor": cursor + limit if cursor + limit < len(paths) else None}
+
+    def notes_categories(self):
+        cfg, _ = self.binding()
+        paths = self.paths(cfg)
+        categories = {}
+        for path in paths:
+            if "/" not in path:
+                continue
+            directory = path.rsplit("/", 1)[0]
+            parts = directory.split("/")
+            for n in range(1, len(parts) + 1):
+                key = "/".join(parts[:n])
+                categories[key] = categories.get(key, 0) + 1
+        return {"repository": cfg["repository"], "root": cfg["root"],
+                "categories": [{"path": key, "markdown_count": categories[key]} for key in sorted(categories)],
+                "root_files": [p for p in paths if "/" not in p], "total_markdown": len(paths),
+                "scope": "bound directory only; counts include category README/index files"}
 
     def notes_get(self, path):
         cfg, _ = self.binding()
         f = self.file(cfg["repository"], self.note_path(cfg, path), cfg["branch"])
         return {"path": path, "content": f["text"], "sha": f["sha"], "url": f["html_url"]}
 
-    def notes_search(self, query, cursor=0, limit=20):
+    def notes_search(self, query, cursor=0, limit=20, category=None):
         self.pagination(cursor, limit, 40)
         if not query.strip() or len(query) > 200:
             raise Error("Query must contain 1 to 200 characters.", "invalid_query")
         cfg, _ = self.binding()
-        paths = self.paths(cfg)
+        paths = self.paths(cfg, category)
         selected, matches, skipped = paths[cursor:cursor + limit], [], []
         for path in selected:
             try:
@@ -358,8 +383,91 @@ class Notes:
             if excerpts or query.casefold() in path.casefold():
                 matches.append({"path": path, "sha": f["sha"], "url": f["html_url"], "excerpts": excerpts})
         next_cursor = cursor + limit if cursor + limit < len(paths) else None
-        return {"query": query, "matches": matches, "scanned": len(selected), "total_files": len(paths), "skipped": skipped,
+        return {"query": query, "category": category, "root": cfg["root"], "matches": matches, "scanned": len(selected), "total_files": len(paths), "skipped": skipped,
                 "complete": cursor == 0 and next_cursor is None and not skipped, "next_cursor": next_cursor}
+
+    def asset_path(self, cfg, path):
+        relative = path_name(path)
+        if not relative.startswith("assets/") or Path(relative).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            raise Error("Images must be PNG, JPEG or WebP files under assets/.", "invalid_path")
+        return self.scoped_path(cfg, relative)
+
+    def asset_file(self, cfg, full_path, ref):
+        value = self.github.api("repos/{}/contents/{}?ref={}".format(cfg["repository"], quote(full_path, safe="/"), quote(ref, safe="")))
+        if not isinstance(value, dict) or value.get("type") != "file":
+            raise Error("Expected a regular image file.", "not_a_file")
+        if value.get("size", 0) > MAX_ASSET_BYTES:
+            raise Error("Images are limited to 8 MiB each.", "file_too_large")
+        if value.get("encoding") == "base64":
+            encoded = value.get("content", "")
+        else:
+            blob = self.github.api("repos/{}/git/blobs/{}".format(cfg["repository"], value["sha"]))
+            if blob.get("encoding") != "base64":
+                raise Error("GitHub did not return image bytes.", "content_unavailable")
+            encoded = blob.get("content", "")
+        try:
+            data = base64.b64decode(re.sub(r"\s", "", encoded), validate=True)
+        except (ValueError, TypeError):
+            raise Error("GitHub returned invalid image bytes.", "invalid_response")
+        if len(data) != value.get("size") or len(data) > MAX_ASSET_BYTES:
+            raise Error("Image size did not match GitHub metadata.", "verification_failed")
+        return value, data
+
+    @staticmethod
+    def image_type(path, data):
+        ext = Path(path).suffix.lower()
+        if ext == ".png" and len(data) >= 33 and data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR":
+            return "image/png"
+        if ext in (".jpg", ".jpeg") and len(data) >= 4 and data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9"):
+            return "image/jpeg"
+        if ext == ".webp" and len(data) >= 16 and data[:4] == b"RIFF" and data[8:12] == b"WEBP" and int.from_bytes(data[4:8], "little") + 8 == len(data):
+            return "image/webp"
+        raise Error("File signature does not match the image extension. SVG and executable formats are not accepted.", "invalid_image")
+
+    def notes_asset_info(self, path):
+        cfg, _ = self.binding()
+        value, data = self.asset_file(cfg, self.asset_path(cfg, path), cfg["branch"])
+        mime = self.image_type(path, data)
+        return {"path": path, "sha": value["sha"], "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data), "mime_type": mime, "url": value["html_url"], "verified": True}
+
+    def notes_asset_create(self, path, source_path, message="docs: save note image"):
+        cfg, _ = self.binding(write=True)
+        full = self.asset_path(cfg, path)
+        source = Path(source_path).expanduser()
+        if not source.is_absolute() or not source.is_file():
+            raise Error("source_path must identify an existing absolute local image file.", "invalid_source")
+        if source.stat().st_size > MAX_ASSET_BYTES:
+            raise Error("Images are limited to 8 MiB each.", "file_too_large")
+        with source.open("rb") as stream:
+            data = stream.read(MAX_ASSET_BYTES + 1)
+        if len(data) > MAX_ASSET_BYTES:
+            raise Error("Images are limited to 8 MiB each.", "file_too_large")
+        mime = self.image_type(path, data)
+        if not isinstance(message, str) or not message.strip() or len(message) > 240:
+            raise Error("Commit message must contain 1 to 240 characters.", "invalid_message")
+        try:
+            old, old_data = self.asset_file(cfg, full, cfg["branch"])
+        except Error as error:
+            if error.status != 404:
+                raise
+        else:
+            if old_data == data:
+                return {"changed": False, "path": path, "sha": old["sha"], "url": old["html_url"],
+                        "size": len(data), "mime_type": mime, "sha256": hashlib.sha256(data).hexdigest(), "verified": True}
+            raise Error("Image exists with different bytes. Choose a new versioned filename.", "already_exists")
+        result = self.github.api("repos/{}/contents/{}".format(cfg["repository"], quote(full, safe="/")), "PUT",
+                                 {"message": message, "content": base64.b64encode(data).decode("ascii"), "branch": cfg["branch"]})
+        commit = result["commit"]["sha"]
+        try:
+            verified, actual = self.asset_file(cfg, full, commit)
+        except Error:
+            raise Error("Image commit was created, but read-back failed. Inspect commit {} before retrying.".format(commit), "verification_unknown")
+        if actual != data:
+            raise Error("Image read-back differs. Inspect commit " + commit, "verification_failed")
+        return {"changed": True, "path": path, "sha": verified["sha"], "commit_sha": commit,
+                "size": len(data), "mime_type": mime, "sha256": hashlib.sha256(data).hexdigest(),
+                "url": result["content"]["html_url"], "verified": True}
 
     def notes_create(self, path, content, message="docs: save research note"):
         cfg, _ = self.binding(write=True)
@@ -399,9 +507,12 @@ TOOLS = [
     spec("notes_bind_repository", "Remember a user-selected repository locally. Does not write remote content.", {"repository": S, "root": S, "allow_public": {"type": "boolean"}}, ["repository"], read=False),
     spec("notes_create_repository", "Create a repository when requested; private by default. Does not automatically bind it.", {"name": S, "description": S, "private": {"type": "boolean"}}, read=False, idempotent=False),
     spec("notes_initialize", "Create a portable notes-directory marker only when absent.", read=False),
-    spec("notes_list", "List notes inside the bound directory; return pagination and total count.", PAGE),
+    spec("notes_categories", "List existing category/subcategory paths and Markdown counts within the bound directory."),
+    spec("notes_list", "List notes inside the bound directory, optionally filtered by category; return pagination and total count.", dict(PAGE, category=S)),
     spec("notes_get", "Read a note and its current SHA before editing.", {"path": S}, ["path"]),
-    spec("notes_search", "Search one bounded page of note content; inspect skipped files and next_cursor.", dict(PAGE, query=S), ["query"]),
+    spec("notes_search", "Search one bounded page of note content, optionally within a category; inspect skipped files and next_cursor.", dict(PAGE, query=S, category=S), ["query"]),
+    spec("notes_asset_info", "Read and verify a saved image's type, size and checksum before retrying uncertain writes.", {"path": S}, ["path"]),
+    spec("notes_asset_create", "Save a local PNG/JPEG/WebP under assets/ and verify committed bytes; never overwrite a different image.", {"path": S, "source_path": S, "message": S}, ["path", "source_path"], read=False),
     spec("notes_create", "Create a Markdown note without overwriting, then verify the committed content.", {"path": S, "content": S, "message": S}, ["path", "content"], read=False, idempotent=False),
     spec("notes_update", "Update using expected_sha from a prior read. Conflicts refuse overwrites.", {"path": S, "content": S, "expected_sha": S, "message": S}, ["path", "content", "expected_sha"], read=False),
     spec("notes_append", "Append using expected_sha. Read first before retrying uncertain writes.", {"path": S, "content": S, "expected_sha": S, "message": S}, ["path", "content", "expected_sha"], read=False, idempotent=False),
