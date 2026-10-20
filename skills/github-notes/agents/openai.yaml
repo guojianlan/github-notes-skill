@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub 笔记"
+  short_description: "授权 GitHub 并管理独立笔记库，保存调研、搜索历史和更新验证结果"
+  default_prompt: "使用 $github-notes 保存、检索或更新我的 GitHub 调研笔记。"
